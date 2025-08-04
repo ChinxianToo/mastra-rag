@@ -17,25 +17,37 @@ async function extractTextFromDocx(docxPath: string): Promise<string> {
   return value;
 }
 
-// Function to extract text from CSV
-function extractTextFromCsv(csvPath: string): string {
+// Function to extract text from CSV with better structure
+function extractTextFromCsv(csvPath: string): string[] {
   const fileContent = fs.readFileSync(csvPath, "utf-8");
   const records = csvParse(fileContent, {
     columns: true,
     skip_empty_lines: true,
   });
 
-  // Convert CSV records to text format
-  let textContent = "";
+  const documents: string[] = [];
+  
   for (const record of records as Record<string, string>[]) {
-    // Join all values in the record and add as a paragraph
-    const recordText = Object.entries(record)
-      .map(([key, value]) => `${key}: ${value}`)
-      .join(", ");
-    textContent += recordText + "\n\n";
+    const title = record['Title (Example in CM21)'] || '';
+    const description = record['Ticket Description'] || '';
+    const troubleshooting = record['Troubleshooting Description'] || '';
+    const category = record['Category'] || '';
+    const subCategory = record['Sub Category'] || '';
+    
+    // Create a well-structured document with all relevant information
+    const document = `
+TITLE: ${title}
+CATEGORY: ${category}
+SUB_CATEGORY: ${subCategory}
+DESCRIPTION: ${description}
+TROUBLESHOOTING_STEPS:
+${troubleshooting}
+    `.trim();
+    
+    documents.push(document);
   }
 
-  return textContent;
+  return documents;
 }
 
 async function extractTextFromPDF(pdfPath: string): Promise<string> {
@@ -69,19 +81,17 @@ async function clearIndex(
       console.log(`Index '${indexName}' does not exist, no need to delete`);
     }
   } catch (error) {
-    console.log(`Error while checking/clearing index '${indexName}':`, error);
-    // Continue execution even if we encounter an error here
+    // If the table doesn't exist, that's expected for a fresh setup
+    console.log(`Index table doesn't exist yet, this is normal for first-time setup`);
+    console.log(`Continuing to create new index...`);
   }
 }
 
 async function main() {
-  const pgVector = new PgVector({ connectionString: process.env.DB_URI! });
+  const pgVector = new PgVector({ connectionString: process.env.VECTOR_DB_URL! });
 
   try {
-    // First check if the index exists and clear it
-    await clearIndex(pgVector, INDEX_NAME);
-
-    // Create the index after ensuring it doesn't exist
+    // Try to create the index directly first
     console.log(`Creating index '${INDEX_NAME}'...`);
     await pgVector.createIndex({
       indexName: INDEX_NAME,
@@ -89,15 +99,22 @@ async function main() {
     });
     console.log(`Index '${INDEX_NAME}' created successfully`);
   } catch (error) {
-    // If index already exists, try to delete it and recreate
-    console.log(`Error creating index, attempting to delete existing index...`);
-    await clearIndex(pgVector, INDEX_NAME);
-
-    // Now try to create the index again
+    console.log(`Error creating index:`, error);
+    console.log(`Attempting to clear existing index and recreate...`);
+    
+    // If creation fails, try to clear and recreate
+    try {
+      await clearIndex(pgVector, INDEX_NAME);
+    } catch (clearError) {
+      console.log(`Could not clear index:`, clearError);
+    }
+    
+    // Try to create the index again
     await pgVector.createIndex({
       indexName: INDEX_NAME,
       dimension: 768, // nomic-embed-text produces 768-dimensional vectors
     });
+    console.log(`Index '${INDEX_NAME}' created successfully on second attempt`);
   }
 
   // List all document files in the docs directory
@@ -110,28 +127,21 @@ async function main() {
     console.log(`Processing: ${filePath}`);
 
     // Extract text based on file type
-    let text: string;
+    let documents: string[] = [];
     if (file.endsWith(".docx")) {
-      text = await extractTextFromDocx(filePath);
+      const text = await extractTextFromDocx(filePath);
+      documents = [text];
     } else if (file.endsWith(".csv")) {
-      text = extractTextFromCsv(filePath);
+      documents = extractTextFromCsv(filePath);
     } else if (file.endsWith(".pdf")) {
-      text = await extractTextFromPDF(filePath);
+      const text = await extractTextFromPDF(filePath);
+      documents = [text];
     } else {
       console.log(`Skipping unsupported file type: ${file}`);
       continue;
     }
 
-    // Chunk the document
-    const doc = MDocument.fromText(text);
-    const chunks = await doc.chunk({
-      strategy: "recursive",
-      size: 1000,
-      overlap: 250,
-      separator: "\n\n",
-    });
-
-    console.log(`Number of chunks for ${file}:`, chunks.length);
+    console.log(`Number of documents for ${file}:`, documents.length);
 
     const openai = createOpenAI({
       baseURL: "http://localhost:11434/v1",
@@ -139,21 +149,39 @@ async function main() {
       compatibility: "compatible",
     });
 
-    // Generate embeddings
-    const { embeddings } = await embedMany({
-      model: openai.embedding("nomic-embed-text:latest"),
-      values: chunks.map((chunk) => chunk.text),
-    });
+    // Process each document with better chunking strategy
+    for (let i = 0; i < documents.length; i++) {
+      const doc = MDocument.fromText(documents[i]);
+      
+      // Use larger chunks to preserve semantic meaning and keep troubleshooting steps together
+      const chunks = await doc.chunk({
+        strategy: "recursive",
+        size: 3000, // Larger chunks to keep complete troubleshooting steps
+        overlap: 800, // Good overlap for context continuity
+        separator: "\n\n",
+      });
 
-    // Store embeddings
-    await pgVector.upsert({
-      indexName: INDEX_NAME,
-      vectors: embeddings,
-      metadata: chunks.map((chunk: { text: string }) => ({
-        text: chunk.text,
-        source: file,
-      })),
-    });
+      console.log(`Number of chunks for document ${i + 1}:`, chunks.length);
+
+      // Generate embeddings
+      const { embeddings } = await embedMany({
+        model: openai.embedding("nomic-embed-text:latest"),
+        values: chunks.map((chunk) => chunk.text),
+      });
+
+      // Store embeddings with enriched metadata
+      await pgVector.upsert({
+        indexName: INDEX_NAME,
+        vectors: embeddings,
+        metadata: chunks.map((chunk: { text: string }) => ({
+          text: chunk.text,
+          source: file,
+          documentIndex: i,
+          chunkType: file.endsWith(".csv") ? "troubleshooting_entry" : "document",
+          hasTroubleshootingSteps: chunk.text.toLowerCase().includes("step") || chunk.text.toLowerCase().includes("troubleshooting"),
+        })),
+      });
+    }
 
     console.log(`Stored embeddings for ${file}`);
   }
